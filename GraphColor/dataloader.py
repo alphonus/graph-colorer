@@ -1,4 +1,4 @@
-import os.path as osp
+import os #.path as osp
 import torch
 from torch_geometric.data import Dataset, InMemoryDataset, Data
 import torch_geometric.transforms as T
@@ -23,7 +23,8 @@ def load_colform(file_path, coloring_file=None, train=False, gen_fake=False):
         fname = file_path.split('/')[-1]
         y = coloring_file.get(fname)
         if y is None:
-            raise FileNotFoundError('No coloring for Graph provided.')
+            raise FileNotFoundError('No coloring for Graph provided.\n'
+                                    f"Graph:{fname} has no coloring\n")
     with open(file_path) as filepointer:
 
         for line in filepointer:
@@ -43,45 +44,74 @@ def load_colform(file_path, coloring_file=None, train=False, gen_fake=False):
         while candidate[0]==candidate[1] or frozenset(candidate) not in edge_set:
             candidate = (random.randint(0, n_vertex - 1), random.randint(0, n_vertex - 1))
         edge_index.append(candidate)
-        y = (y[0], False) #### Because degree increased by 1???
+        #y = torch.tensor((y[0:-1], False)) #### Because degree increased by 1???
+        y = torch.cat([y[0:-1].clone().detach(), torch.tensor([False])])
     edge_index = torch.tensor(edge_index, dtype=torch.long)
     #generate random embeding for x
     x = torch.randint(n_vertex-1, (n_vertex,1), dtype=torch.float)
-
-    return T.ToUndirected()(Data(x=x, edge_index=edge_index.T, y=y))
+    return Data(x=x, edge_index=edge_index.T, y=y, name=fname)#T.ToUndirected()(
 
 class ColorDataset(InMemoryDataset):
-    def __init(self, root, transform=None, pre_transform=None, pre_filter=None):
-        super().__init__(root, transform, pre_transform)
-        self.data, self. slices = torch.load(self.processed_paths[0])
+    def __init__(self, root, transform=None, pre_transform=None, pre_filter=None):
+        super().__init__(root, transform, pre_transform, pre_filter)
+
+        out = torch.load(self.processed_paths[0])
+        if not isinstance(out, tuple) or len(out) != 3:
+            raise RuntimeError(
+                "The 'data' object was created by an older version of ColorDataset. "
+                "If this error occurred while loading an already existing "
+                "dataset, remove the 'processed/' directory in the dataset's "
+                "root folder and try again.")
+
+        self.data, self.slices, self.sizes = out
 
     @property
     def raw_file_names(self):
-        return ['some_file_1', 'some_file_2']
+        return ['export.csv']
 
     @property
     def processed_file_names(self):
-        return ['data_1.pt']
+        return 'data.pt'
 
 
+    #@property
+    #def num_node_attributes(self) -> int:
+    #    return self.sizes['num_node_attributes']
+
+    @property
+    def num_classes(self) -> int:
+        return self.sizes['num_classes']
 
     def process(self):
         data_list = []
-        for raw_path in self.raw_paths:
-            print(raw_path)
-            stop
-            data = load_colform(raw_path)
-            #data = self.load_colform()
-            if self.pre_filter is not None and not self.pre_filter(data):
+        files = os.listdir(os.path.join(self.root, 'raw'))
+        col_file = [os.path.join(self.root, 'raw', s) for s in files if 'csv' in s][0]
+        coloring = dict()
+        y_encoding = {'DLMCOL': 0, 'mcs': 1, 'ILS-TS': 2, 'dsatur': 3, 'hybrid-dsatur': 4, 'head': 5, 'tabucol': 6,
+                      'lmxrlf': 7}
+
+        with open(col_file) as f:
+            next(f)
+            for line in f:
+                file, algo, ncol, time, valid = line.split(',')
+                coloring[file] = torch.tensor(
+                    [y_encoding[algo], int(ncol), bool(valid)])  # (algo, int(ncol), float(time), bool(valid))
+        for graph_path in [os.path.join(self.root, 'raw', s) for s in files if '.col' in s]:
+            try:
+                data_list.append(load_colform(graph_path, coloring_file=coloring))
+            except FileNotFoundError:
+                #print(f"Skipping file {graph_path}")
                 continue
 
-            if self.pre_transform is not None:
-                data = self.pre_transform(data)
-            torch.save(data, osp.join(self.processed_dir, f'data_{idx}.pt'))
-            idx += 1
+        if self.pre_filter is not None:
+            # and not self.pre_filter(data):
+            data_list = [data for data in data_list if self.pre_filter(data)]
 
-    #def len(self):
-    #    return len(self.processed_file_names)
-    #def get(self):
-    #    data = torch.load(osp.join(self.processed_dir, f'data_{idx}.pt'))
-    #    return data
+        if self.pre_transform is not None:
+            data_list = [self.pre_transform(data) for data in data_list]
+        data, slices = self.collate(data_list)
+        sizes = {
+            'num_node_attributes': 1,
+            'num_classes': len(y_encoding)
+        }
+        torch.save((data, slices, sizes), self.processed_paths[0])
