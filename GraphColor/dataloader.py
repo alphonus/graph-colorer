@@ -22,6 +22,9 @@ def load_colform(file_path, coloring_file=None, train=False, gen_fake=False, dat
     if coloring_file:
         fname = file_path.split('/')[-1]
         y = coloring_file.get(fname)
+        n_col = y[1]
+        valid = y[2]
+        y = y[0]
         if y is None:
             raise FileNotFoundError('No coloring for Graph provided.\n'
                                     f"Graph:{dataset+fname} has no coloring\n")
@@ -44,12 +47,16 @@ def load_colform(file_path, coloring_file=None, train=False, gen_fake=False, dat
         while candidate[0]==candidate[1] or frozenset(candidate) not in edge_set:
             candidate = (random.randint(0, n_vertex - 1), random.randint(0, n_vertex - 1))
         edge_index.append(candidate)
-        #y = torch.tensor((y[0:-1], False)) #### Because degree increased by 1???
-        y = torch.cat([y[0:-1].clone().detach(), torch.tensor([False])])
+        #y = torch.cat([y[0:-1].clone().detach(), torch.tensor([False])])
+        valid = False
+        n_col = y[1]
+        y = y[0]
+
+
     edge_index = torch.tensor(edge_index, dtype=torch.long)
     #generate random embeding for x
     x = torch.randint(n_vertex-1, (n_vertex,1), dtype=torch.float)
-    data = Data(x=x, edge_index=edge_index.T, y=y, name=dataset+fname)
+    data = Data(x=x, edge_index=edge_index.T, y=y, n_col=n_col, valid=valid, name=dataset+fname)
     if not data.validate():
         print(f"Error reading file {dataset+fname}")
         data = None

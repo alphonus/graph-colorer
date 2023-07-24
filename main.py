@@ -2,6 +2,7 @@
 #%load_ext autoreload
 
 #%autoreload 2
+#%%
 from GraphColor.dataloader import ColorDataset, ColorMultiDataset
 from GraphColor.model import *
 from torch_geometric.loader import DataLoader
@@ -21,10 +22,10 @@ import networkx as nx
 
 #writer = SummaryWriter()
 config = {
-        "learning_rate": 0.01,
-        "architecture": "GATv2  [norm]",
+        "learning_rate": 0.02,
+        "architecture": "Amazon Multi Loss",
         "dataset": "reddit-ER-FIRST",
-        "epochs": 50,
+        "epochs": 75,
         "log_interval": 2,
     }
 wandb.init(
@@ -112,22 +113,8 @@ def test(loader):
      return correct / len(loader.dataset)  # Derive ratio of correct predictions.
 
 
-#%% Temp
-from torch_geometric.datasets import TUDataset
-from torch_geometric.utils import to_networkx
-import networkx as nx
-from torch.utils.data import ConcatDataset
-#dataset = TUDataset(root='data/TUDataset', name='REDDIT-MULTI-12K')
-#for i, graph in enumerate(dataset):
-#    G = to_networkx(graph, to_undirected=True, remove_self_loops=True)
-#    mapping = dict(zip(G, range(len(G.nodes) + 1)))
-#    G = nx.relabel_nodes(G, mapping)
-#   nx.write_edgelist(G, f"data/TUDataset/REDDIT-MULTI-12K/processed/reddit_graph_{i}.edgelist", data=False)
-#    with open(f"data/TUDataset/REDDIT-MULTI-12K/processed/reddit_graph_{i}.col", 'w') as fileheader:
-#        fileheader.write(f'p edge {len(G.nodes)} {len(G.edges)}\n')
-#        for edge in G.edges:
-#            fileheader.write('e {} {}\n'.format(*tuple(map(lambda x: x + 1, edge))))
-#%%
+
+#%% Process Data
 #if __name__=='__main__':
 NUM_PROCESSES = 4
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -180,9 +167,10 @@ y_encoding = {'DLMCOL': 0, 'mcs': 1, 'ILS-TS': 2, 'dsatur': 3, 'hybrid-dsatur': 
 # data_list = [load_colform(file, coloring_file=coloring).to(device) for file in files] #+ [load_colform(file, coloring_file=coloring, gen_fake=True) for file in files]
 loader_train = DataLoader(train_set, batch_size=4, shuffle=True, num_workers=0, pin_memory=False)
 loader_test = DataLoader(test_set, batch_size=4, shuffle=True, num_workers=0, pin_memory=False)
-#%%
+#%% Train Model
 print("...Creating Model...")
 model = AmazonNet2(1, 32, loader_train.dataset.num_classes, n_heads=1)
+#model = SimpleNet(1, loader_train.dataset.num_classes)
 
 model.to(device)
 wandb.watch(model, log_freq=10)
@@ -191,6 +179,7 @@ wandb.watch(model, log_freq=10)
 optimizer = torch.optim.AdamW(model.parameters(), lr=config['learning_rate'])
 scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=30, gamma=0.1)
 criterion = torch.nn.CrossEntropyLoss()
+#criterion = torch.nn.KLDivLoss(reduction='batchmean')
 print("...Start Training...")
 processes = []
 #for rank in range(NUM_PROCESSES):
@@ -204,20 +193,31 @@ def train(epoch):
     model.train()
     idx = torch.tensor(0, device=device)
     loss_all = 0
+    total_pots_loss = 0
     for data in loader_train:
-        optimizer.zero_grad()
+
         try:
-            out = model(data.x, data.edge_index, batch=data.batch)  # Perform a single forward pass.
+            out, color = model(data.x, data.edge_index, batch=data.batch)  # Perform a single forward pass.
+            #print(out.shape)
+            out = F.softmax(out, dim=1)
+            color = F.softmax(color, dim=1)
+            adj = torch_geometric.utils.to_dense_adj(data.edge_index, data.batch, max_num_nodes=data.num_nodes)
+            #print(out)
+
         except RuntimeError as e:
             print(f"Error using data {data}")
             raise e
-        y = torch.flatten(torch.index_select(torch.reshape(data.y, (-1, 3)), 1, idx))
+        #y = torch.flatten(torch.index_select(torch.reshape(data.y, (-1, 3)), 1, idx))
+        #print(y.shape)
+        #print(y)
+
         try:
-            loss = criterion(out, y)  # Compute the loss solely based on the training nodes.
+            loss = criterion(out, data.y)  # Compute the loss solely based on the training nodes.
+
         except ValueError:
             raise ValueError("wrong dimensions \n"
                              f"prediction shape: {out.shape}\n"
-                             f"truth: {y}\n"
+                             #f"truth: {y}\n"
                              f"truth: {data.y}\n"
                              f"truth: {data.y.shape}\n"
                              f"input: {data.x.shape}\n"
@@ -226,43 +226,65 @@ def train(epoch):
                              f"batch size: {torch.max(data.batch) + 1}\n"
                              f"batch size: {data.num_graphs}\n"
                              f"Graphs: {data.name}")
-        loss.backward()
+        try:
+            loss_pots = pots_loss_func(color, adj)
+        except RuntimeError as e:
+            print("color", color.shape)
+            print("adj", adj.shape)
+            print("data", data.x.shape)
+            raise e
+        #print(loss.item())
+        #stop
+        optimizer.zero_grad()
+        (loss + loss_pots).backward()
+        #loss_pots.backward()
         loss_all += loss.item() * data.num_graphs
+        total_pots_loss += loss_pots * data.num_graphs
         optimizer.step()
-    return loss_all / len(train_set)
+    return {'cat_loss': loss_all / len(train_set), 'pots_loss': total_pots_loss/ len(train_set)}
 
 def test(loader):
     model.eval()
     idx = torch.tensor(0, device=device)
     correct = 0
+    total_pots_loss = 0
     for data in loader:
-        data = data.to(device)
-        output = model(data.x, data.edge_index, data.batch)
+        #data = data.to(device)
+        output, color = model(data.x, data.edge_index, data.batch)
+        output = F.softmax(output, dim=1)
+        #color = F.softmax(color, dim=1)
+        del color
+
+        #adj = torch_geometric.utils.to_dense_adj(data.edge_index, data.batch, max_num_nodes=data.num_nodes)
+        loss_pots = 0#pots_loss_func(color, adj)
+        # selects the index of the max value
         pred = output.max(dim=1)[1]
-        truth = y = torch.flatten(torch.index_select(torch.reshape(data.y, (-1, 3)), 1, idx))
-        correct += pred.eq(truth).sum().item()
-    return correct / len(loader.dataset)
+        #truth = y = torch.flatten(torch.index_select(torch.reshape(data.y, (-1, 3)), 1, idx))
+        correct += pred.eq(data.y).sum().item()
+        total_pots_loss += loss_pots * data.num_graphs
+    return {'acc': correct / len(loader.dataset), 'pots_loss': total_pots_loss/len(loader.dataset)}
 
 for epoch in range(1, config['epochs']):
     train_loss = train(epoch)
     train_acc = test(loader_train)
     test_acc = test(loader_test)
-    print('Epoch: {:03d}, Train Loss: {:.7f}, '
-          'Train Acc: {:.7f}, Test Acc: {:.7f}'.format(epoch, train_loss,
-                                                       train_acc, test_acc))
+    print('Epoch: {:03d}, Train Cat_Loss: {:.7f}, Train Pots_Loss: {:.7f}, '
+          'Train Acc: {:.7f}, Test Acc: {:.7f}'.format(epoch, train_loss['cat_loss'], train_loss['pots_loss'],
+                                                       train_acc['acc'], test_acc['acc']))
     if epoch % config['log_interval'] == 0:
         wandb.log({
-        "train / loss": train_loss,
-        "train / acc": train_acc,
-        #"test / loss": validation_loss,
-        "test / acc": test_acc
+        "train / cat_loss": train_loss['cat_loss'],
+        "train / pots_loss": train_loss['pots_loss'],
+        "train / acc": train_acc['acc'],
+        "test / pots_loss": test_acc['pots_loss'],
+        "test / acc": test_acc['acc']
         })
 
 #train(loader, loader_test, 50, criterion=criterion, optimizer=optimizer)
 
 
 #%% Analys
-
+"""
 from torch_geometric.explain import Explainer, GNNExplainer
 explainer = Explainer(
     model=model,
@@ -283,6 +305,7 @@ print(explanation.node_mask)
 #explanation.visualize_feature_importance(top_k=10)
 #explanation.visualize_graph()
 #%%
+max_chrom = 0
 for i, data in enumerate(train_set):
     try:
         if not data.validate():
@@ -290,3 +313,5 @@ for i, data in enumerate(train_set):
     except ValueError:
         print(f"IndexError in data entry No{i} name:{data.name}")
         continue
+    max_chrom = max(max_chrom, data.n_col)
+"""
