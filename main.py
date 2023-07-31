@@ -3,8 +3,9 @@
 
 #%autoreload 2
 #%%
-from GraphColor.dataloader import ColorDataset, ColorMultiDataset
+from GraphColor.dataloader import ColorDataset, ColorMultiDataset, RandColoring, ColoringOneHot
 from GraphColor.model import *
+from torch_geometric.nn.models import GAT
 from torch_geometric.loader import DataLoader
 import torch_geometric.transforms
 import torch
@@ -20,21 +21,13 @@ from torch_geometric.utils import to_networkx
 import matplotlib.pyplot as plt
 import networkx as nx
 
-#writer = SummaryWriter()
-config = {
-        "learning_rate": 0.02,
-        "architecture": "Amazon Multi Loss",
-        "dataset": "reddit-ER-FIRST",
-        "epochs": 75,
-        "log_interval": 2,
-    }
-wandb.init(
-    # set the wandb project where this run will be logged
-    project="Graphs-AAS",
+hypers = {
+    'num_features': 8,
+    'embedding_dim': 32
 
-    # track hyperparameters and run metadata
-    config=config
-)
+}
+
+
 
 def min_size(data, n):
     return data.x.shape[0] > n
@@ -56,74 +49,22 @@ def visualize_embedding(h, color=None, epoch=None, loss=None):
     plt.show()
 #G = to_networkx(data_list[0], to_undirected=True)
 #visualize_graph(G, color=data_list[0].x)#[1]
-#%%
-from torch_geometric.datasets import TUDataset
-import numpy as np
-#dataset = TUDataset(root='data/TUDataset', name='MUTAG')
-#loader = DataLoader(dataset, batch_size=64, shuffle=False)
-
-
-def train(model, loader, loader_test, epochs, criterion=None, optimizer=None):
-    if criterion is None or optimizer is None:
-        raise ValueError("No input")
-    for epoch in range(epochs):
-        train_sub(model, loader, criterion, optimizer)
-        if epoch % 5 == 0:
-            acc = test(model, loader_test)
-            print(f'Epoch: {epoch:03d}, Train Acc: {acc:.4f}')
-
-def train_sub(loader, criterion, optimizer):
-    model.train()
-    idx = torch.tensor(0, device=device)
-    for data in loader:
-        try:
-            out = model(data.x, data.edge_index, batch=data.batch)  # Perform a single forward pass.
-        except RuntimeError as e:
-            print(f"Error using data {data}")
-            raise e
-        y = torch.flatten(torch.index_select(torch.reshape(data.y, (-1,3)), 1, idx))
-        try:
-            loss = criterion(out, y)  # Compute the loss solely based on the training nodes.
-        except ValueError:
-            raise ValueError("wrong dimensions \n"
-                             f"prediction shape: {out.shape}\n"
-                             f"truth: {y}\n"
-                             f"truth: {data.y}\n"
-                             f"truth: {data.y.shape}\n"
-                             f"input: {data.x.shape}\n"
-                             f"truth: {data}\n"
-                             #f"batch size: {data.batch}\n"
-                             f"batch size: {torch.max(data.batch)+1}\n"
-                             f"batch size: {data.num_graphs}\n"
-                             f"Graphs: {data.name}")
-        loss.backward()  # Derive gradients.
-        optimizer.step()  # Update parameters based on gradients.
-        optimizer.zero_grad()
-
-def test(loader):
-     model.eval()
-     #idx = np.array([i for i in range(loader.batch_size * 3) if i % 3 == 0])
-     idx = torch.tensor(0, device=device)
-     correct = 0
-     for data in loader:  # Iterate in batches over the training/test dataset.
-         out = model(data.x, data.edge_index, data.batch)
-         pred = out.argmax(dim=1)  # Use the class with highest probability.
-         y = torch.flatten(torch.index_select(torch.reshape(data.y, (-1, 3)), 1, idx))
-         correct += int((pred == y).sum())  # Check against ground-truth labels.
-     return correct / len(loader.dataset)  # Derive ratio of correct predictions.
-
-
 
 #%% Process Data
 #if __name__=='__main__':
 NUM_PROCESSES = 4
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
+"""
 pre_transforms = torch_geometric.transforms.Compose(
-    [torch_geometric.transforms.ToUndirected()])
+    [torch_geometric.transforms.ToUndirected()]) #, ColoringOneHot(hypers['num_features'], cat=False), RandColoring(hypers['num_features'])
 transforms = torch_geometric.transforms.Compose(
-    [torch_geometric.transforms.ToDevice(device)])
-
+   [ torch_geometric.transforms.ToDevice(device)])
+"""
+pre_transforms = torch_geometric.transforms.Compose(
+    [torch_geometric.transforms.ToUndirected(), RandColoring(hypers['num_features'])]) #, ColoringOneHot(hypers['num_features'], cat=False), RandColoring(hypers['num_features'])
+transforms = torch_geometric.transforms.Compose(
+   [ torch_geometric.transforms.ToDevice(device)])
 # def min_size(n, data):
 #    1
 #    return data.x.shape[0] > n
@@ -137,6 +78,7 @@ filters = partial(min_size, n=50)  #curry the funtion to keep graphs with more t
 from numpy.random import default_rng
 import math
 graph_dataset = ColorMultiDataset(root='data/', pre_transform=pre_transforms, transform=transforms, pre_filter=filters)
+#graph_dataset = ColorDataset(root='data/WS', pre_transform=pre_transforms, transform=transforms)
 for i, data in enumerate(graph_dataset):
     try:
         if not data.validate():
@@ -165,20 +107,49 @@ y_encoding = {'DLMCOL': 0, 'mcs': 1, 'ILS-TS': 2, 'dsatur': 3, 'hybrid-dsatur': 
 # files = [os.path.join('data/raw', file) for file in os.listdir('data/raw') if file.endswith('.col')]
 
 # data_list = [load_colform(file, coloring_file=coloring).to(device) for file in files] #+ [load_colform(file, coloring_file=coloring, gen_fake=True) for file in files]
-loader_train = DataLoader(train_set, batch_size=4, shuffle=True, num_workers=0, pin_memory=False)
-loader_test = DataLoader(test_set, batch_size=4, shuffle=True, num_workers=0, pin_memory=False)
+loader_train = DataLoader(train_set, batch_size=1, shuffle=True, num_workers=0, pin_memory=False)
+loader_test = DataLoader(test_set, batch_size=1, shuffle=True, num_workers=0, pin_memory=False)
 #%% Train Model
 print("...Creating Model...")
-model = AmazonNet2(1, 32, loader_train.dataset.num_classes, n_heads=1)
-#model = SimpleNet(1, loader_train.dataset.num_classes)
 
+config = {
+        "learning_rate": 0.02,
+        'feature_rep': 'nn.Embedding',
+        "architecture": "GAT jk:last",
+        "dataset": "reddit",
+        "epochs": 75,
+        "log_interval": 2,
+        #'NUM_ACCUMULATION_STEPS': 8,
+        'n_colors': 32,
+        **hypers
+    } 
+wandb.init(
+    # set the wandb project where this run will be logged
+    project="Graphs-AAS",
+
+    # track hyperparameters and run metadata
+    config=config
+   
+)
+
+
+model = AmazonNet(config['num_features'], config['embedding_dim'], loader_train.dataset.num_classes, n_heads=2)
+#model = GAT(config['num_features'], config['embedding_dim'], 3 , loader_train.dataset.num_classes, jk=None)
+#model = SimpleNet(1, loader_train.dataset.num_classes)
 model.to(device)
+
 wandb.watch(model, log_freq=10)
 #model.share_memory()
+from itertools import chain
 
-optimizer = torch.optim.AdamW(model.parameters(), lr=config['learning_rate'])
-scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=30, gamma=0.1)
+embed = torch.nn.Embedding(config['n_colors'], config['num_features'])
+embed.to(device)
+params = chain(model.parameters(), embed.parameters())
+
+optimizer = torch.optim.AdamW(params, lr=config['learning_rate'])
+#scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=30, gamma=0.1)
 criterion = torch.nn.CrossEntropyLoss()
+scaler = torch.cuda.amp.GradScaler()
 #criterion = torch.nn.KLDivLoss(reduction='batchmean')
 print("...Start Training...")
 processes = []
@@ -189,17 +160,44 @@ processes = []
 #for p in processes:
 #    p.join()
 
-def train(epoch):
+hash_tensor = torch.vmap(lambda x: x % config['n_colors'])
+
+def train_single(epoch):
     model.train()
-    idx = torch.tensor(0, device=device)
+    #idx = torch.tensor(0, device=device)
+    loss_all = 0
+    for data in loader_train:
+        """
+        input = torch.squeeze(embed(hash_tensor(data.x.long())))
+        out = model(input, data.edge_index)  # , data.batch Perform a single forward pass.
+        """
+        out = model(data.x, data.edge_index, data.batch) 
+        out = F.softmax(out, dim=1)
+
+        loss = criterion(out, data.y) 
+
+
+        loss_all += loss.item() * data.num_graphs
+        
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+    return {'cat_loss': loss_all / len(train_set),'pots_loss': 0}
+
+def train_pots(epoch):
+    model.train()
+    #idx = torch.tensor(0, device=device)
     loss_all = 0
     total_pots_loss = 0
     for data in loader_train:
 
         try:
-            out, color = model(data.x, data.edge_index, batch=data.batch)  # Perform a single forward pass.
+            
+            input = torch.squeeze(embed(hash_tensor(data.x.long())))
+            out, color = model(input, data.edge_index, batch=data.batch)  # Perform a single forward pass.
             #print(out.shape)
-            out = F.softmax(out, dim=1)
+            #out = F.softmax(out, dim=1)
             color = F.softmax(color, dim=1)
             adj = torch_geometric.utils.to_dense_adj(data.edge_index, data.batch, max_num_nodes=data.num_nodes)
             #print(out)
@@ -233,8 +231,7 @@ def train(epoch):
             print("adj", adj.shape)
             print("data", data.x.shape)
             raise e
-        #print(loss.item())
-        #stop
+
         optimizer.zero_grad()
         (loss + loss_pots).backward()
         #loss_pots.backward()
@@ -245,15 +242,18 @@ def train(epoch):
 
 def test(loader):
     model.eval()
-    idx = torch.tensor(0, device=device)
     correct = 0
-    total_pots_loss = 0
+    
     for data in loader:
         #data = data.to(device)
-        output, color = model(data.x, data.edge_index, data.batch)
+        """
+        input = torch.squeeze(embed(hash_tensor(data.x.long())))
+        output = model(input, data.edge_index) #, data.batch
+        """
+        output = model(data.x, data.edge_index, data.batch) 
         output = F.softmax(output, dim=1)
         #color = F.softmax(color, dim=1)
-        del color
+        
 
         #adj = torch_geometric.utils.to_dense_adj(data.edge_index, data.batch, max_num_nodes=data.num_nodes)
         loss_pots = 0#pots_loss_func(color, adj)
@@ -261,11 +261,11 @@ def test(loader):
         pred = output.max(dim=1)[1]
         #truth = y = torch.flatten(torch.index_select(torch.reshape(data.y, (-1, 3)), 1, idx))
         correct += pred.eq(data.y).sum().item()
-        total_pots_loss += loss_pots * data.num_graphs
-    return {'acc': correct / len(loader.dataset), 'pots_loss': total_pots_loss/len(loader.dataset)}
+        
+    return {'acc': correct / len(loader.dataset),'pots_loss':0}
 
 for epoch in range(1, config['epochs']):
-    train_loss = train(epoch)
+    train_loss = train_single(epoch)
     train_acc = test(loader_train)
     test_acc = test(loader_test)
     print('Epoch: {:03d}, Train Cat_Loss: {:.7f}, Train Pots_Loss: {:.7f}, '
@@ -276,42 +276,6 @@ for epoch in range(1, config['epochs']):
         "train / cat_loss": train_loss['cat_loss'],
         "train / pots_loss": train_loss['pots_loss'],
         "train / acc": train_acc['acc'],
-        "test / pots_loss": test_acc['pots_loss'],
+        #"test / pots_loss": test_acc['pots_loss'],
         "test / acc": test_acc['acc']
         })
-
-#train(loader, loader_test, 50, criterion=criterion, optimizer=optimizer)
-
-
-#%% Analys
-"""
-from torch_geometric.explain import Explainer, GNNExplainer
-explainer = Explainer(
-    model=model,
-    algorithm=GNNExplainer(epochs=200),
-    explanation_type='model',
-    node_mask_type='object',
-    edge_mask_type='object',
-    model_config=dict(
-        mode='multiclass_classification',
-        task_level='graph',
-        return_type='probs',  # Model returns probabilities.
-    ),
-)
-data = test_set[0]
-explanation = explainer(data.x, data.edge_index)
-print(explanation.edge_mask)
-print(explanation.node_mask)
-#explanation.visualize_feature_importance(top_k=10)
-#explanation.visualize_graph()
-#%%
-max_chrom = 0
-for i, data in enumerate(train_set):
-    try:
-        if not data.validate():
-            print(f"Error in data entry No{i} name:{data.name}")
-    except ValueError:
-        print(f"IndexError in data entry No{i} name:{data.name}")
-        continue
-    max_chrom = max(max_chrom, data.n_col)
-"""

@@ -1,9 +1,70 @@
+from torch_geometric.data import Dataset, InMemoryDataset, Data
+from torch_geometric.transforms import BaseTransform
+from torch_geometric.data.datapipes import functional_transform
+import torch_geometric.transforms as T
+import torch.nn.functional as F
+
+import random
 import os #.path as osp
 import torch
-from torch_geometric.data import Dataset, InMemoryDataset, Data
-import torch_geometric.transforms as T
-import random
+import copy
+from typing import Any
+import numpy as np
 
+class RandColoring(BaseTransform):
+    def __init__(
+        self,
+        max_color: int,
+        cat: bool = False
+    ):
+        self.max_color = max_color
+        self.cat = cat
+        
+    def __call__(self, data: Any) -> Any:
+        # Shallow-copy the data so that we prevent in-place data modification.
+        return self.forward(copy.copy(data))
+
+    def gen_density(self, data: Data) -> Data:
+        x = data.x
+        def rand_vals(seed):
+            return torch.randint(int(seed)+1,(1, self.max_color))
+        rand = []
+        for seed in np.nditer(x.reshape(-1).numpy()):
+            rand.append(rand_vals(seed))
+        rand = torch.vstack(rand).float()
+        #rand = F.softmax(rand, dim=1)
+        rand = torch.nn.functional.layer_norm(rand, (self.max_color,))
+        return rand
+    
+    def forward(self, data: Data) -> Data:
+        rand = self.gen_density(data)
+        x = data.x
+        if x is not None and self.cat:
+            x = x.view(-1, 1) if x.dim() == 1 else x
+            data.x = torch.cat([x, rand.to(x.dtype)], dim=-1)
+        else:
+            data.x = rand
+
+        return data
+
+    def __repr__(self) -> str:
+        return f'{self.__class__.__name__}({self.max_color})'
+
+
+class ColoringOneHot(RandColoring):
+
+    def forward(self, data: Data) -> Data:
+        rand = self.gen_density(data)
+        rand = torch.argmax(rand, dim=1)
+        rand = F.one_hot(rand, self.max_color).long()
+        x = data.x
+        if x is not None and self.cat:
+            x = x.view(-1, 1) if x.dim() == 1 else x
+            data.x = torch.cat([x, rand.to(x.dtype)], dim=-1)
+        else:
+            data.x = rand
+
+        return data
 
 
 def load_colform(file_path, coloring_file=None, train=False, gen_fake=False, dataset: str=''):
@@ -153,11 +214,19 @@ class ColorMultiDataset(ColorDataset):
 
             for graph in [s for s in os.listdir(os.path.join(self.root, dataset, 'raw')) if '.col' in s]:
                 graph_path = os.path.join(self.root, dataset, 'raw', graph)
+
                 try:
-                    data_list.append(load_colform(graph_path, coloring_file=coloring, dataset=dataset+'_'))
+                    data = load_colform(graph_path, coloring_file=coloring, dataset=dataset+'_')
+                    data.validate()
+                    data_list.append(data)
                 except FileNotFoundError as e:
                     print(f"Error in file {graph}, {graph_path}")
                     raise e
+                except ValueError:
+                    print(f"IndexError in data entry name:{data.name}")
+                    continue
+                finally:
+                    data = None
 
         if self.pre_filter is not None:
             # and not self.pre_filter(data):
@@ -165,7 +234,7 @@ class ColorMultiDataset(ColorDataset):
 
         if self.pre_transform is not None:
             data_list = [self.pre_transform(data) for data in data_list]
-        print(data_list)
+        #print(data_list)
 
         data, slices = self.collate(data_list)
         sizes = {

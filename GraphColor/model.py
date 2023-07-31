@@ -1,8 +1,8 @@
 import torch
-from torch.nn import Dropout
+from torch.nn import Dropout, Linear
 import torch.nn.functional as F
 # from torch.nn import Linear
-from torch_geometric.nn import SAGEConv, GATv2Conv, GCNConv, global_mean_pool, Linear, BatchNorm
+from torch_geometric.nn import SAGEConv, GATv2Conv, GCNConv, global_mean_pool, BatchNorm, LayerNorm
 
 
 class AmazonNet(torch.nn.Module):
@@ -15,21 +15,20 @@ class AmazonNet(torch.nn.Module):
         super(AmazonNet, self).__init__()
         self.conv1 = GATv2Conv(num_features, hidden_dim, heads=n_heads)
         self.conv2 = GATv2Conv(hidden_dim*n_heads, hidden_dim, heads=n_heads, concat=False)
-        self.dropout = Dropout(p=0.2)
-        self.classifier = Linear(hidden_dim, num_classes)
+        self.classifier = Linear(hidden_dim*n_heads, num_classes)
 
-    def forward(self, x, edge_index, batch=None):
+    def forward(self, x, edge_index, batch):
         #x, edge_index = data.x, data.edge_index
-        x, edge_index = self.conv1(x, edge_index)
-        x = x.relu()
-        x = self.dropout(x)
-        x, edge_index = self.conv2(x, edge_index)
-        x = x.relu()
-        x = global_mean_pool(x, batch)
+        first_conv = self.conv1(x, edge_index)
+        pre_pool = F.leaky_relu(first_conv)
+        post_pool = global_mean_pool(pre_pool, batch)
+        x = F.dropout(post_pool, p=0.1, training=self.training)
         x = self.classifier(x)
-        x = F.softmax(x, dim=1)
+        
 
-        return x#out, x
+        return x, pre_pool, post_pool, first_conv
+
+
 
 class AmazonNet2(torch.nn.Module):
     """
@@ -42,15 +41,17 @@ class AmazonNet2(torch.nn.Module):
         enc_dim = 32
         self.encoder = Linear(num_features, enc_dim)
         self.conv1 = GATv2Conv(num_features, hidden_dim, heads=n_heads, concat=True, dropout=0.2)
-        self.norm = BatchNorm(hidden_dim*n_heads)
-        self.conv2 = GATv2Conv(hidden_dim*n_heads, hidden_dim, heads=n_heads, concat=False, dropout=0.2)
-        self.conv3 = GATv2Conv(hidden_dim, chrom_number, heads=n_heads, concat=False, dropout=0.2)
+        #self.norm = BatchNorm(hidden_dim*n_heads)
+        self.norm = LayerNorm(hidden_dim*n_heads, mode='graph')
+        self.conv2 = GATv2Conv(hidden_dim*n_heads, hidden_dim, heads=n_heads, dropout=0.2)
+        self.conv3 = GATv2Conv(hidden_dim*n_heads, num_features, heads=n_heads, concat=False, dropout=0.2)
         self.algo_classifier = Linear(hidden_dim*n_heads, num_classes)
+        self.apply(self._init_weights)
 
-    def forward(self, x, edge_index, batch=None):
+    def forward(self, x, edge_index, batch):
         x = self.conv1(x, edge_index)
         x = F.relu(x)
-        x = self.norm(x)
+        x = self.norm(x, batch)
         x = self.conv2(x, edge_index)
 
         color = F.relu(x)
@@ -59,10 +60,31 @@ class AmazonNet2(torch.nn.Module):
         classif = global_mean_pool(x, batch)
 
         # print("pool", x.shape)
-        classif = F.dropout(classif, p=0.3, training=self.training)
+        classif = F.dropout(classif, p=0.1, training=self.training)
         classif = self.algo_classifier(classif)
 
-        return classif, color  # out, x
+        return classif, color
+    
+    def _init_weights(self, module):
+        if isinstance(module, GATv2Conv):
+            pass
+        elif isinstance(module, Linear):
+            module.weight = torch.nn.init.xavier_uniform_(module.weight)
+            #module.weight.data.normal_(mean=0.0, std=0.25)
+            if module.bias is not None:
+                module.bias.data.zero_()
+        #elif isinstance(module, BatchNorm):
+        #      module.bias.data.zero_()
+        #    module.weight.data.fill_(1.0)
+        
+
+
+
+
+
+
+
+
 
 # helper function for graph-coloring loss
 def pots_loss_func(probs, adj_tensor):
